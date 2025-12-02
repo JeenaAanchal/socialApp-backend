@@ -2,18 +2,22 @@ const mongoose = require("mongoose");
 
 const connectDB = async () => {
   try {
-    if (!process.env.DBURL) {
+    const dbUrl = process.env.DBURL;
+    if (!dbUrl) {
       throw new Error("DBURL not defined in .env");
     }
 
-    await mongoose.connect(process.env.DBURL); // no options needed
+    // Connect to MongoDB
+    await mongoose.connect(dbUrl); // no need for options in Mongoose v6+
+
     console.log("✅ Database connected");
   } catch (err) {
-    console.error("❌ Database connection failed", err.message);
+    console.error("❌ Database connection failed:", err.message);
     process.exit(1);
   }
 };
 
+// Listen to connection events
 mongoose.connection.on("disconnected", () =>
   console.warn("⚠️ MongoDB disconnected")
 );

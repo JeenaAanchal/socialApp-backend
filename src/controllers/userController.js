@@ -2,10 +2,12 @@ const User = require("../models/User");
 const { createNotification } = require("./notificationController");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const cloudinary = require("../config/cloudinary");
 
-// --- UTILS ---
-const sanitizeUser = (user) => {
-  const obj = user.toObject();
+// Utility to remove password from returned user object
+const sanitizeUser = (userDoc) => {
+  if (!userDoc) return null;
+  const obj = userDoc.toObject ? userDoc.toObject() : { ...userDoc };
   delete obj.password;
   return obj;
 };
@@ -26,7 +28,7 @@ exports.signup = async (req, res) => {
 
     res.status(201).json({ status: 1, user: sanitizeUser(user), token });
   } catch (err) {
-    console.error(err);
+    console.error("signup error:", err);
     res.status(500).json({ message: "Signup failed" });
   }
 };
@@ -44,180 +46,270 @@ exports.login = async (req, res) => {
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: "7d" });
     res.json({ status: 1, user: sanitizeUser(user), token });
   } catch (err) {
-    console.error(err);
+    console.error("login error:", err);
     res.status(500).json({ message: "Login failed" });
   }
 };
 
 // --- GET OWN PROFILE ---
 exports.getProfile = async (req, res) => {
-  const user = await User.findById(req.userId)
-    .select("-password")
-    .populate("followers following", "username profilePic");
-  if (!user) return res.status(404).json({ message: "User not found" });
-  res.json({ status: 1, user });
+  try {
+    const user = await User.findById(req.userId)
+      .select("-password")
+      .populate("followers following", "username profilePic");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json({ status: 1, user });
+  } catch (err) {
+    console.error("getProfile error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 };
 
-// --- UPDATE PROFILE ---
+// --- UPDATE PROFILE (username / bio) ---
 exports.updateProfile = async (req, res) => {
-  const updates = {};
-  ["username", "bio"].forEach((key) => {
-    if (req.body[key] !== undefined) updates[key] = req.body[key];
-  });
+  try {
+    const updates = {};
+    ["username", "bio"].forEach((key) => {
+      if (req.body[key] !== undefined) updates[key] = req.body[key];
+    });
 
-  if (updates.username) {
-    const exists = await User.findOne({ username: updates.username });
-    if (exists && String(exists._id) !== String(req.userId))
-      return res.status(400).json({ message: "Username already taken" });
+    if (updates.username) {
+      const exists = await User.findOne({ username: updates.username });
+      if (exists && String(exists._id) !== String(req.userId))
+        return res.status(400).json({ message: "Username already taken" });
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: "No updates provided" });
+    }
+
+    const user = await User.findByIdAndUpdate(req.userId, updates, { new: true })
+      .select("-password")
+      .populate("followers following", "username profilePic");
+
+    return res.json({ status: 1, user });
+  } catch (err) {
+    console.error("updateProfile error:", err);
+    return res.status(500).json({ message: "Failed to update profile" });
   }
-
-  const user = await User.findByIdAndUpdate(req.userId, updates, { new: true })
-    .select("-password")
-    .populate("followers following", "username profilePic");
-  res.json({ status: 1, user });
 };
 
 // --- UPLOAD PROFILE PIC ---
 exports.uploadProfilePic = async (req, res) => {
-  if (!req.file || !req.file.filename)
-    return res.status(400).json({ message: "Image missing" });
+  try {
+    // multer-storage-cloudinary usually attaches file.path or file.secure_url / file.url
+    if (!req.file) {
+      return res.status(400).json({ message: "Image missing" });
+    }
 
-  const profilePicPath = `/uploads/${req.file.filename}`;
-  const user = await User.findByIdAndUpdate(req.userId, { profilePic: profilePicPath }, { new: true })
-    .select("-password")
-    .populate("followers following", "username profilePic");
+    // Try multiple properties to find the uploaded file URL
+    const file = req.file;
+    const possibleUrls = [
+      file.path,
+      file.url,
+      file.secure_url,
+      file.secureUrl,
+      file.location, // some storages use location
+      file.publicUrl,
+      file.public_url,
+    ];
+    const profilePicURL = possibleUrls.find((u) => typeof u === "string" && u.length > 0);
 
-  res.json({ status: 1, user });
+    if (!profilePicURL) {
+      // As a fallback, if you configured cloudinary directly (not via storage), you could upload here.
+      console.warn("uploadProfilePic: uploaded file did not expose URL on expected props:", Object.keys(file));
+      return res.status(500).json({ message: "Uploaded but could not determine file URL" });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      { profilePic: profilePicURL },
+      { new: true }
+    )
+      .select("-password")
+      .populate("followers following", "username profilePic");
+
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    return res.json({ status: 1, user });
+  } catch (err) {
+    console.error("Upload Profile Pic Error:", err);
+    return res.status(500).json({ message: "Failed to upload profile picture." });
+  }
 };
 
 // --- CHANGE PASSWORD ---
 exports.changePassword = async (req, res) => {
-  const { oldPassword, newPassword } = req.body;
-  const user = await User.findById(req.userId);
-  if (!user) return res.status(404).json({ message: "User not found" });
+  try {
+    const { oldPassword, newPassword } = req.body;
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-  const isMatch = await bcrypt.compare(oldPassword, user.password);
-  if (!isMatch) return res.status(400).json({ message: "Old password incorrect" });
+    const isMatch = await bcrypt.compare(oldPassword, user.password);
+    if (!isMatch) return res.status(400).json({ message: "Old password incorrect" });
 
-  user.password = await bcrypt.hash(newPassword, 10);
-  await user.save();
-  res.json({ status: 1, message: "Password updated" });
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+    return res.json({ status: 1, message: "Password updated" });
+  } catch (err) {
+    console.error("changePassword error:", err);
+    return res.status(500).json({ message: "Failed to change password" });
+  }
 };
 
-// --- FOLLOW & UNFOLLOW ---
+// --- FOLLOW / UNFOLLOW / BLOCK / UNBLOCK ---
+// (Keep your existing implementations; just wrap in try/catch for safety)
 exports.followUser = async (req, res) => {
-  const targetId = req.params.id;
-  if (String(req.userId) === String(targetId))
-    return res.status(400).json({ message: "Can't follow yourself" });
+  try {
+    const targetId = req.params.id;
+    if (String(req.userId) === String(targetId))
+      return res.status(400).json({ message: "Can't follow yourself" });
 
-  const me = await User.findById(req.userId);
-  const target = await User.findById(targetId);
-  if (!me || !target) return res.status(404).json({ message: "User not found" });
+    const me = await User.findById(req.userId);
+    const target = await User.findById(targetId);
+    if (!me || !target) return res.status(404).json({ message: "User not found" });
 
-  if (!me.following.includes(targetId)) {
-    me.following.push(targetId);
-    target.followers.push(req.userId);
-    await me.save();
-    await target.save();
+    if (!me.following.includes(targetId)) {
+      me.following.push(targetId);
+      target.followers.push(req.userId);
+      await me.save();
+      await target.save();
 
-    await createNotification({ type: "follow", sender: req.userId, receiver: targetId });
+      await createNotification({ type: "follow", sender: req.userId, receiver: targetId });
+    }
+
+    const profile = await User.findById(targetId)
+      .populate("followers following", "username profilePic")
+      .select("-password");
+
+    return res.json({ status: 1, user: profile });
+  } catch (err) {
+    console.error("followUser error:", err);
+    return res.status(500).json({ message: "Follow failed" });
   }
-
-  const profile = await User.findById(targetId)
-    .populate("followers following", "username profilePic")
-    .select("-password");
-
-  res.json({ status: 1, user: profile });
 };
 
 exports.unfollowUser = async (req, res) => {
-  const targetId = req.params.id;
-  const me = await User.findById(req.userId);
-  const target = await User.findById(targetId);
-  if (!me || !target) return res.status(404).json({ message: "User not found" });
+  try {
+    const targetId = req.params.id;
+    const me = await User.findById(req.userId);
+    const target = await User.findById(targetId);
+    if (!me || !target) return res.status(404).json({ message: "User not found" });
 
-  me.following = me.following.filter(f => f.toString() !== targetId);
-  target.followers = target.followers.filter(f => f.toString() !== req.userId);
+    me.following = me.following.filter((f) => f.toString() !== targetId);
+    target.followers = target.followers.filter((f) => f.toString() !== req.userId);
 
-  await me.save();
-  await target.save();
+    await me.save();
+    await target.save();
 
-  const profile = await User.findById(targetId)
-    .populate("followers following", "username profilePic")
-    .select("-password");
+    const profile = await User.findById(targetId)
+      .populate("followers following", "username profilePic")
+      .select("-password");
 
-  res.json({ status: 1, user: profile });
+    return res.json({ status: 1, user: profile });
+  } catch (err) {
+    console.error("unfollowUser error:", err);
+    return res.status(500).json({ message: "Unfollow failed" });
+  }
 };
 
-// --- BLOCK & UNBLOCK ---
 exports.blockUser = async (req, res) => {
-  const targetId = req.params.id;
-  if (String(req.userId) === String(targetId))
-    return res.status(400).json({ message: "Can't block yourself" });
+  try {
+    const targetId = req.params.id;
+    if (String(req.userId) === String(targetId))
+      return res.status(400).json({ message: "Can't block yourself" });
 
-  const me = await User.findById(req.userId);
-  const target = await User.findById(targetId);
-  if (!me || !target) return res.status(404).json({ message: "User not found" });
+    const me = await User.findById(req.userId);
+    const target = await User.findById(targetId);
+    if (!me || !target) return res.status(404).json({ message: "User not found" });
 
-  if (!me.blockedUsers.includes(targetId)) me.blockedUsers.push(targetId);
+    if (!me.blockedUsers.includes(targetId)) me.blockedUsers.push(targetId);
 
-  // Remove from followers/following
-  me.following = me.following.filter(f => f.toString() !== targetId);
-  me.followers = me.followers.filter(f => f.toString() !== targetId);
-  target.following = target.following.filter(f => f.toString() !== req.userId);
-  target.followers = target.followers.filter(f => f.toString() !== req.userId);
+    me.following = me.following.filter((f) => f.toString() !== targetId);
+    me.followers = me.followers.filter((f) => f.toString() !== targetId);
+    target.following = target.following.filter((f) => f.toString() !== req.userId);
+    target.followers = target.followers.filter((f) => f.toString() !== req.userId);
 
-  await me.save();
-  await target.save();
+    await me.save();
+    await target.save();
 
-  const profile = await User.findById(targetId)
-    .populate("followers following", "username profilePic")
-    .select("-password");
+    const profile = await User.findById(targetId)
+      .populate("followers following", "username profilePic")
+      .select("-password");
 
-  res.json({ status: 1, user: profile });
+    return res.json({ status: 1, user: profile });
+  } catch (err) {
+    console.error("blockUser error:", err);
+    return res.status(500).json({ message: "Block failed" });
+  }
 };
 
 exports.unblockUser = async (req, res) => {
-  const targetId = req.params.id;
-  const me = await User.findById(req.userId);
-  if (!me) return res.status(404).json({ message: "User not found" });
+  try {
+    const targetId = req.params.id;
+    const me = await User.findById(req.userId);
+    if (!me) return res.status(404).json({ message: "User not found" });
 
-  me.blockedUsers = me.blockedUsers.filter(id => id.toString() !== targetId);
-  await me.save();
+    me.blockedUsers = me.blockedUsers.filter((id) => id.toString() !== targetId);
+    await me.save();
 
-  const profile = await User.findById(targetId)
-    .populate("followers following", "username profilePic")
-    .select("-password");
+    const profile = await User.findById(targetId)
+      .populate("followers following", "username profilePic")
+      .select("-password");
 
-  res.json({ status: 1, user: profile });
+    return res.json({ status: 1, user: profile });
+  } catch (err) {
+    console.error("unblockUser error:", err);
+    return res.status(500).json({ message: "Unblock failed" });
+  }
 };
 
 // --- FOLLOWERS & FOLLOWING LISTS ---
 exports.getFollowers = async (req, res) => {
-  const user = await User.findById(req.userId).populate("followers", "username profilePic");
-  if (!user) return res.status(404).json({ message: "User not found" });
-  res.json({ status: 1, followers: user.followers });
+  try {
+    const user = await User.findById(req.userId).populate("followers", "username profilePic");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json({ status: 1, followers: user.followers });
+  } catch (err) {
+    console.error("getFollowers error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 };
 
 exports.getFollowersById = async (req, res) => {
-  const user = await User.findById(req.params.id).populate("followers", "username profilePic");
-  if (!user) return res.status(404).json({ message: "User not found" });
-  res.json({ followers: user.followers });
+  try {
+    const user = await User.findById(req.params.id).populate("followers", "username profilePic");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json({ followers: user.followers });
+  } catch (err) {
+    console.error("getFollowersById error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 };
 
 exports.getFollowingById = async (req, res) => {
-  const user = await User.findById(req.params.id).populate("following", "username profilePic");
-  if (!user) return res.status(404).json({ message: "User not found" });
-  res.json({ following: user.following });
+  try {
+    const user = await User.findById(req.params.id).populate("following", "username profilePic");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json({ following: user.following });
+  } catch (err) {
+    console.error("getFollowingById error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 };
 
 // --- GET PROFILE BY ID ---
 exports.getProfileById = async (req, res) => {
-  const user = await User.findById(req.params.id)
-    .select("-password")
-    .populate("followers following", "username profilePic");
-  if (!user) return res.status(404).json({ message: "User not found" });
-  res.json({ status: 1, user });
+  try {
+    const user = await User.findById(req.params.id)
+      .select("-password")
+      .populate("followers following", "username profilePic");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    return res.json({ status: 1, user });
+  } catch (err) {
+    console.error("getProfileById error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
 };
 
 // --- SEARCH USERS ---
@@ -226,12 +318,39 @@ exports.searchUsers = async (req, res) => {
     const { q } = req.query;
     if (!q?.trim()) return res.json({ users: [] });
 
-    const users = await User.find({ username: { $regex: q, $options: "i" } })
-      .select("_id username profilePic");
+    const users = await User.find({ username: { $regex: q, $options: "i" } }).select(
+      "_id username profilePic"
+    );
 
-    res.json({ users });
+    return res.json({ users });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Server error" });
+    console.error("searchUsers error:", err);
+    return res.status(500).json({ message: "Server error" });
   }
 };
+
+// --- DELETE ACCOUNT ---
+// --- DELETE ACCOUNT WITH PASSWORD ---
+exports.deleteAccount = async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ message: "Password is required" });
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ message: "Incorrect password" });
+
+    await User.findByIdAndDelete(req.userId);
+
+    // Optionally: remove user data from other collections
+
+    return res.json({ status: 1, message: "Account deleted successfully" });
+  } catch (err) {
+    console.error("deleteAccount error:", err);
+    return res.status(500).json({ message: "Failed to delete account" });
+  }
+};
+
+

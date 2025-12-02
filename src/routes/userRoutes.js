@@ -17,6 +17,7 @@ const {
   searchUsers,
   getFollowersById,
   getFollowingById,
+  deleteAccount,
 } = require("../controllers/userController");
 
 const router = express.Router();
@@ -48,6 +49,10 @@ router.get("/:id/following", authMiddleware, getFollowingById);
 // Block / Unblock
 router.post("/block/:id", authMiddleware, blockUser);
 router.post("/unblock/:id", authMiddleware, unblockUser);   // NEW
+
+//delete account permanently
+router.delete("/delete-account", authMiddleware, deleteAccount);
+
 
 // Get user by ID (keep last)
 router.get("/:id", authMiddleware, getProfileById);
